@@ -68,7 +68,9 @@ async def subsonic_json_hint(request: Request, call_next):
     if request.url.path.startswith('/api/') and not request.url.path.startswith('/api/web-auth/'):
         session = get_web_session(request)
         if session is None:
-            return JSONResponse({'detail': 'Unauthorized'}, status_code=401)
+            # The SPA keeps its cookie until an API call fails, so a stale or
+            # invalidated session must produce a message the UI can display.
+            return JSONResponse({'detail': '登录已失效，请重新登录后再操作'}, status_code=401)
 
     return await call_next(request)
 

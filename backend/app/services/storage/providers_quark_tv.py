@@ -46,6 +46,24 @@ class QuarkTVStorageProvider:
     def _raise(self, message: str, *, code: str = 'QUARK_TV_ERROR', cause: Exception | None = None):
         raise StorageError(message, code=code, provider_id=self.provider_id, cause=cause)
 
+    def _parse_json(self, response: httpx.Response, action: str) -> dict[str, Any]:
+        """Parse a Quark response even when the HTTP status is 4xx.
+
+        Quark reports normal login states (``errno=11003`` "user has not
+        confirmed yet") with HTTP 400, so ``raise_for_status()`` must not run
+        before the JSON body is inspected.
+        """
+        try:
+            data = response.json()
+        except ValueError:
+            self._raise(
+                f'QuarkTV {action} failed: HTTP {response.status_code} {response.text[:200]}'.strip(),
+                code='REMOTE_ERROR',
+            )
+        if not isinstance(data, dict):
+            self._raise(f'QuarkTV {action} failed: unexpected response body', code='REMOTE_ERROR')
+        return data
+
     def _check_ready(self) -> None:
         if not self.refresh_token:
             self._raise('QuarkTV provider missing refresh_token', code='CONFIG_INVALID')
@@ -97,10 +115,9 @@ class QuarkTVStorageProvider:
             self._raise('QuarkTV token exchange missing code/refresh_token', code='CONFIG_INVALID')
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(f'{self._code_api}{pathname}', json=body)
-            response.raise_for_status()
-            data = response.json()
+        data = self._parse_json(response, 'token exchange')
         if int(data.get('code') or 0) != 200:
-            self._raise(str(data.get('message') or 'QuarkTV token exchange failed'), code='AUTH_FAILED')
+            self._raise(str(data.get('message') or data.get('error_info') or 'QuarkTV token exchange failed'), code='AUTH_FAILED')
         token_data = dict(data.get('data') or {})
         return token_data
 
@@ -207,10 +224,13 @@ class QuarkTVStorageProvider:
         }
         async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
             response = await client.get(f'{self._api}{pathname}', params=params)
-            response.raise_for_status()
-            data = response.json()
-        if int(data.get('status') or 200) >= 400:
-            self._raise(str(data.get('message') or data.get('error_info') or 'QuarkTV get login code failed'), code='REMOTE_ERROR')
+        data = self._parse_json(response, 'get login code')
+        status_value = int(data.get('status') or 200)
+        if response.status_code >= 400 or status_value >= 400 or status_value < 0:
+            self._raise(
+                str(data.get('error_info') or data.get('message') or f'QuarkTV get login code failed: HTTP {response.status_code}'),
+                code='REMOTE_ERROR',
+            )
         return {
             'qr_data': str(data.get('qr_data') or ''),
             'query_token': str(data.get('query_token') or ''),
@@ -249,8 +269,7 @@ class QuarkTVStorageProvider:
         }
         async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
             response = await client.get(f'{self._api}{pathname}', params=params)
-            response.raise_for_status()
-            data = response.json()
+        data = self._parse_json(response, 'poll login')
         code = str(data.get('code') or '')
         if code:
             token_data = await self._exchange_token_async(code=code)
@@ -267,6 +286,24 @@ class QuarkTVStorageProvider:
                 'access_token': access_token,
                 'device_id': self.device_id,
             }
+
+        errno = int(data.get('errno') or 0)
+        error_info = str(data.get('error_info') or data.get('message') or '').strip()
+        # 11003: the QR code has not been confirmed in the Quark app yet.
+        if errno == 11003 or '未确认' in error_info:
+            return {
+                'ok': True,
+                'authorized': False,
+                'pending': True,
+                'message': error_info or '尚未在夸克 App 中确认授权',
+                'device_id': self.device_id,
+            }
+        # 11002: the QR code expired; the user must request a new one.
+        if errno == 11002 or '过期' in error_info:
+            self._raise('登录二维码已过期，请重新获取登录码', code='LOGIN_EXPIRED')
+        status_value = int(data.get('status') or 0)
+        if response.status_code >= 400 or status_value < 0:
+            self._raise(error_info or f'QuarkTV poll failed: HTTP {response.status_code}', code='REMOTE_ERROR')
         return {
             'ok': True,
             'authorized': False,

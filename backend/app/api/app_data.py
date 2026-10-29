@@ -651,11 +651,12 @@ async def test_storage_provider(payload: dict = Body(...)) -> dict:
 
 @router.post('/settings/quark-tv/login/start')
 async def start_quark_tv_login(payload: dict = Body(...)) -> dict:
-    storage, provider_id = _build_storage_from_payload(payload)
-    provider = storage.get_provider(provider_id)
-    if getattr(provider, 'provider_type', '') != 'quark_tv':
-        raise HTTPException(status_code=400, detail='当前 provider 不是 quark_tv')
+    provider_id = str(payload.get('provider_id') or '').strip()
     try:
+        storage, provider_id = _build_storage_from_payload(payload)
+        provider = storage.get_provider(provider_id)
+        if getattr(provider, 'provider_type', '') != 'quark_tv':
+            raise HTTPException(status_code=400, detail='当前 provider 不是 quark_tv')
         data = await provider.start_login_async()
         if not data.get('qr_data') or not data.get('query_token'):
             raise HTTPException(status_code=400, detail='夸克TV登录码获取失败，返回数据不完整')
@@ -664,6 +665,8 @@ async def start_quark_tv_login(payload: dict = Body(...)) -> dict:
             'provider_id': provider_id,
             **data,
         }
+    except HTTPException:
+        raise
     except StorageError as exc:
         raise HTTPException(status_code=400, detail={
             'message': str(exc),
@@ -671,27 +674,50 @@ async def start_quark_tv_login(payload: dict = Body(...)) -> dict:
             'provider_id': exc.provider_id or provider_id,
             'hint': '登录码获取失败，先检查网络和 quark_tv 配置。',
         })
+    except Exception as exc:
+        logger.exception('quark tv login start crashed provider=%s', provider_id)
+        raise HTTPException(status_code=400, detail={
+            'message': f'获取登录码失败: {exc}',
+            'code': 'LOGIN_START_FAILED',
+            'provider_id': provider_id,
+            'hint': '检查服务器到 open-api-drive.quark.cn 的网络是否正常。',
+        })
 
 
 @router.post('/settings/quark-tv/login/poll')
 async def poll_quark_tv_login(payload: dict = Body(...)) -> dict:
-    storage, provider_id = _build_storage_from_payload(payload)
-    provider = storage.get_provider(provider_id)
-    if getattr(provider, 'provider_type', '') != 'quark_tv':
-        raise HTTPException(status_code=400, detail='当前 provider 不是 quark_tv')
+    provider_id = str(payload.get('provider_id') or '').strip()
     query_token = str(payload.get('query_token') or '').strip()
     try:
+        storage, provider_id = _build_storage_from_payload(payload)
+        provider = storage.get_provider(provider_id)
+        if getattr(provider, 'provider_type', '') != 'quark_tv':
+            raise HTTPException(status_code=400, detail='当前 provider 不是 quark_tv')
         data = await provider.poll_login_async(query_token)
         return {
+            'ok': True,
             'provider_id': provider_id,
             **data,
         }
+    except HTTPException:
+        raise
     except StorageError as exc:
+        hint = '轮询登录失败，确认是否已在夸克 App 中授权。'
+        if exc.code == 'LOGIN_EXPIRED':
+            hint = '二维码已过期，点“获取登录码”重新生成后再扫。'
         raise HTTPException(status_code=400, detail={
             'message': str(exc),
             'code': exc.code,
             'provider_id': exc.provider_id or provider_id,
-            'hint': '轮询登录失败，确认是否已在夸克 App 中授权。',
+            'hint': hint,
+        })
+    except Exception as exc:
+        logger.exception('quark tv login poll crashed provider=%s', provider_id)
+        raise HTTPException(status_code=400, detail={
+            'message': f'轮询登录失败: {exc}',
+            'code': 'LOGIN_POLL_FAILED',
+            'provider_id': provider_id,
+            'hint': '稍后重试；若持续失败，重新获取登录码。',
         })
 
 
