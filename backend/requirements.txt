@@ -13,5 +13,5 @@ alembic==1.13.2
 Pillow==10.3.0
 apscheduler==3.10.4
 cryptography>=42.0.0
-p115client==0.0.8.4.8
+p115client>=0.0.9,<0.1
 oss2==2.18.5

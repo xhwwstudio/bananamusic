@@ -22,13 +22,31 @@ except Exception:  # pragma: no cover - optional runtime dependency
 try:
     from p115client import P115Client
     from p115client.tool.attr import get_attr, get_id_to_path, normalize_attr
-    from p115client.tool.fs_files import iter_fs_files
+    try:
+        from p115client.tool.fs_files import iter_fs_files
+    except ImportError:
+        # p115client >= 0.0.9 renamed iter_fs_files -> fs_files_iter (same
+        # parameters used here: page_size / cooldown / app / request kwargs).
+        from p115client.tool.fs_files import fs_files_iter as iter_fs_files
 except Exception:  # pragma: no cover - optional runtime dependency
     P115Client = None  # type: ignore[assignment]
     get_attr = get_id_to_path = normalize_attr = iter_fs_files = None  # type: ignore[assignment]
 
 from app.services.storage.errors import StorageError
 from app.services.storage.types import StorageEntry, StorageRef
+
+
+def _build_client(cookies: str, **kwargs):
+    """Create a P115Client across p115client versions.
+
+    ``check_for_relogin`` existed in 0.0.8 but was removed from the public
+    constructor in 0.0.9; drop it when the installed version rejects it.
+    """
+    try:
+        return P115Client(cookies=cookies, **kwargs)
+    except TypeError:
+        kwargs.pop('check_for_relogin', None)
+        return P115Client(cookies=cookies, **kwargs)
 
 
 class OneOneFiveStorageProvider:
@@ -380,7 +398,7 @@ class OneOneFiveStorageProvider:
                 self._raise('115 download currently requires cookie login', code='CONFIG_INVALID')
             # 改成更接近 AList/115driver 的模型：
             # 直接基于当前 cookie 导入同一份凭据，不再额外做 login_another_app app bootstrap。
-            self._download_client = P115Client(cookies=self.cookie, check_for_relogin=True)
+            self._download_client = _build_client(self.cookie, check_for_relogin=True)
         return self._download_client
 
     def _download_info(self, pickcode: str, *, user_agent: str | None = None) -> dict[str, Any]:
@@ -579,7 +597,7 @@ class OneOneFiveStorageProvider:
             self._check_ready()
             if not self.cookie.strip():
                 self._raise('115 upload currently requires cookie login', code='CONFIG_INVALID')
-            base_client = P115Client(cookies=self.cookie, check_for_relogin=True)
+            base_client = _build_client(self.cookie, check_for_relogin=True)
             upload_apps = [
                 'android',
                 '115android',
