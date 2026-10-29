@@ -4,7 +4,7 @@
 
 - 上游仓库只提供 README 与截图，不提供源码；本仓库的 `backend/` 来自官方镜像内的 Python 源码（未编译），`frontend/dist/` 为官方构建产物。
 - 本次修复版本：**1.9.1**（上游镜像自报 1.9.0 / 标签 v1.8.9）。
-- 同步问题根因与逐条修复说明见 **[docs/SUBSONIC_FIX.md](docs/SUBSONIC_FIX.md)**，完整项目分析见 **[docs/ANALYSIS.md](docs/ANALYSIS.md)**。
+- 同步问题根因与逐条修复说明见 **[docs/SUBSONIC_FIX.md](docs/SUBSONIC_FIX.md)**，夸克 TV 登录问题见 **[docs/QUARK_TV_LOGIN_FIX.md](docs/QUARK_TV_LOGIN_FIX.md)**，完整项目分析见 **[docs/ANALYSIS.md](docs/ANALYSIS.md)**。
 
 ![首页](docs/images/home.png)
 ![歌单页](docs/images/playlists.png)
@@ -106,6 +106,8 @@ python ../tools/repro_subsonic.py
 | `getArtist` 截断 20 首 | 曲目缺失 | 返回全部 |
 | `startScan` 永远 scanning | 客户端轮询卡住 | 返回真实状态 |
 | 认证不支持 `p=` | PlaySub 等无法连接 | 兼容明文/hex `p` |
+| 夸克 TV 取登录码/轮询报错 | 无法添加夸克存储源 | 夸克把“未确认/已过期”当 HTTP 400 返回，改为先解析 JSON 再判状态（见 [docs/QUARK_TV_LOGIN_FIX.md](docs/QUARK_TV_LOGIN_FIX.md)） |
+| `p115client` 版本锁定失效 | 构建失败 | 放宽到 `>=0.0.9`，兼容 `fs_files_iter` 重命名 |
 
 数据库**无需迁移**。升级后建议在客户端清除缓存并完整重同步（特殊字符艺术家/专辑的 ID 已变更）。
 
