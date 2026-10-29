@@ -1,0 +1,30 @@
+services:
+  musicon:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: bananamusic:1.9.1
+    container_name: bananamusic
+    environment:
+      DATABASE_URL: sqlite:///./data/musicon.db
+      TZ: Asia/Shanghai
+      # 内嵌 LX Server 需要 /app/vendor/lxserver（本仓库未收录）。
+      # 不需要榜单/自动补全时保持 false；需要时改为 true 并挂载 vendor 目录。
+      LX_EMBEDDED_ENABLED: "false"
+      # LX_SERVICE_MODE: remote
+      # LX_REMOTE_URL: http://192.168.1.10:9527
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      # - ./vendor/lxserver:/app/vendor/lxserver:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10

@@ -1,0 +1,846 @@
+--- /dev/null
++++ b/app/core/slugs.py
+@@ -0,0 +1,48 @@
++"""Stable, URL-safe identifiers shared by the web API and the Subsonic layer.
++
++The Subsonic protocol requires that the ids returned by listing endpoints
++(``getArtists`` / ``getIndexes`` / ``getAlbumList2`` ...) can be fed back into
++the detail endpoints (``getArtist`` / ``getMusicDirectory`` / ``getAlbum`` ...).
++All of those endpoints therefore have to derive ids with *exactly* the same
++function.  Historically the database layer used a naive ``lower().replace(' ')``
++while the Subsonic layer used a stricter slug, which made any artist or album
++containing ``/``, ``、``, ``（`` or an apostrophe unresolvable and broke client
++library syncs (e.g. Symfonium).
++
++Keep this module dependency-free so both layers can import it without cycles.
++"""
++from __future__ import annotations
++
++import hashlib
++import re
++import unicodedata
++
++# Everything that is not a latin letter/digit, a CJK ideograph or one of the
++# explicitly allowed punctuation characters becomes a separator.
++_DISALLOWED = re.compile(r'[^0-9a-z\u4e00-\u9fff._()\-]+')
++_REPEATED_DASH = re.compile(r'-{2,}')
++
++
++def slugify(value: str, fallback_prefix: str = 'item') -> str:
++    """Return a deterministic, URL-safe slug for ``value``.
++
++    The transformation is intentionally identical to the historical
++    ``_slugify`` helper in ``app.api.subsonic`` so already published ids keep
++    working for names that did not contain special characters.
++    """
++    text = unicodedata.normalize('NFC', str(value or '')).strip().lower()
++    text = re.sub(r'\s+', '-', text)
++    text = _DISALLOWED.sub('-', text)
++    text = _REPEATED_DASH.sub('-', text).strip('-')
++    if text:
++        return text
++    digest = hashlib.sha1(unicodedata.normalize('NFC', str(value or '')).encode('utf-8')).hexdigest()[:8]
++    return f'{fallback_prefix}-{digest}'
++
++
++def artist_id(name: str) -> str:
++    return slugify(name, 'artist')
++
++
++def album_id(name: str) -> str:
++    return slugify(name, 'album')
+--- a/app/db/compat.py
++++ b/app/db/compat.py
+@@ -60,15 +60,29 @@
+ 
+ 
+ def dt_to_iso(value: Any) -> str:
++    """Normalise timestamps to RFC-3339 UTC strings (``...Z``).
++
++    SQLite stores timestamps as ``YYYY-MM-DD HH:MM:SS`` text; Subsonic clients
++    (Symfonium, DSub, ...) parse ``created``/``starred``/``changed`` as ISO-8601
++    instants, so a space-separated value can abort a sync.
++    """
+     if value is None:
+         return ''
+-    if isinstance(value, datetime):
+-        return value.isoformat()
+     if isinstance(value, bytes):
+         value = value.decode('utf-8', errors='ignore')
+-    if isinstance(value, str):
+-        return value
+-    return str(value)
++    if isinstance(value, datetime):
++        moment = value
++    else:
++        raw = str(value).strip()
++        if not raw:
++            return ''
++        try:
++            moment = datetime.fromisoformat(raw.replace(' ', 'T').replace('Z', '+00:00'))
++        except ValueError:
++            return raw
++    if moment.tzinfo is None:
++        moment = moment.replace(tzinfo=timezone.utc)
++    return moment.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+ 
+ 
+ def db_json_type() -> str:
+--- a/app/main.py
++++ b/app/main.py
+@@ -40,7 +40,7 @@
+         scheduler.shutdown(wait=False)
+ 
+ 
+-app = FastAPI(title=settings.app_name, version='1.9.0', lifespan=lifespan)
++app = FastAPI(title=settings.app_name, version='1.9.1', lifespan=lifespan)
+ 
+ app.add_middleware(
+     CORSMiddleware,
+@@ -79,6 +79,13 @@
+ 
+ APP_ROOT = Path(__file__).resolve().parents[1]
+ STATIC_DIR = APP_ROOT / 'static'
++if not (STATIC_DIR / 'index.html').exists():
++    # When running from a source checkout the Vite bundle lives in
++    # `frontend/dist`; the Docker image copies it to `backend/static`.
++    for candidate in (APP_ROOT.parent / 'frontend' / 'dist', APP_ROOT / 'frontend' / 'dist'):
++        if (candidate / 'index.html').exists():
++            STATIC_DIR = candidate
++            break
+ FRONTEND_INDEX = STATIC_DIR / 'index.html'
+ 
+ ASSETS_DIR = STATIC_DIR / 'assets'
+--- a/app/api/subsonic.py
++++ b/app/api/subsonic.py
+@@ -15,6 +15,7 @@
+ from mutagen import File as MutagenFile
+ 
+ from app.core.config import settings
++from app.core.slugs import slugify
+ from app.db.compat import dt_to_iso
+ from app.services.storage import get_storage_service
+ from app.services.app_settings import get_runtime_settings
+@@ -28,6 +29,7 @@
+     get_playlist,
+     get_song,
+     get_song_rating,
++    get_starred_at,
+     get_subsonic_user,
+     get_task,
+     is_starred_item,
+@@ -111,6 +113,23 @@
+     if value is None:
+         return
+ 
++    # OpenSubsonic defines `openSubsonicExtensions` as a JSON array whose XML
++    # representation is a wrapper element containing repeated
++    # `openSubsonicExtension` children.  The generic list serializer would
++    # repeat the wrapper instead, so handle it explicitly.
++    if key == 'openSubsonicExtensions':
++        holder = SubElement(parent, key)
++        for item in value if isinstance(value, list) else []:
++            if not isinstance(item, dict):
++                continue
++            extension = SubElement(holder, 'openSubsonicExtension')
++            extension.set('name', _xml_scalar(item.get('name', '')))
++            versions = item.get('versions') or []
++            if isinstance(versions, (list, tuple)):
++                versions = ','.join(str(version) for version in versions)
++            extension.set('versions', _xml_scalar(versions))
++        return
++
+     if isinstance(value, list):
+         for item in value:
+             _xml_append(parent, key, item)
+@@ -179,33 +198,66 @@
+     return _subsonic_xml(payload)
+ 
+ 
++_HEX_ONLY = re.compile(r'^[0-9a-fA-F]+$')
++
++
++def _password_candidates(value: str) -> list[str]:
++    """Subsonic sends `p` hex-encoded; tolerate plain-text senders as well."""
++    raw = str(value or '')
++    candidates = [raw]
++    if raw and len(raw) % 2 == 0 and _HEX_ONLY.match(raw):
++        try:
++            decoded = bytes.fromhex(raw).decode('utf-8')
++        except (ValueError, UnicodeDecodeError):
++            decoded = ''
++        if decoded and decoded not in candidates:
++            candidates.insert(0, decoded)
++    return candidates
++
++
++def _subsonic_credentials() -> tuple[str, str]:
++    runtime = get_runtime_settings()
++    return (
++        str(runtime.get('subsonic_user') or settings.subsonic_user),
++        str(runtime.get('subsonic_pass') or settings.subsonic_pass),
++    )
++
++
+ def verify_subsonic_auth(
+     u: str = Query(...),
+-    t: str = Query(...),
+-    s: str = Query(...),
++    t: str | None = Query(None),
++    s: str | None = Query(None),
++    p: str | None = Query(None),
+     f: str | None = Query(None),
+ ) -> dict:
+     response_format_var.set('json' if (f or '').strip().lower() == 'json' else 'xml')
++
++    candidates: list[tuple[str, str, str]] = []
+     user = get_subsonic_user(u)
+     if user and bool(user.get('enabled')):
+-        password = str(user.get('password') or '')
+-        expected = hashlib.md5((password + s).encode()).hexdigest()
+-        if t == expected:
+-            auth = {
+-                'username': str(user.get('username') or u),
+-                'role': str(user.get('role') or 'user'),
+-                'enabled': True,
+-            }
++        candidates.append(
++            (str(user.get('username') or u), str(user.get('password') or ''), str(user.get('role') or 'user'))
++        )
++    runtime_user, runtime_pass = _subsonic_credentials()
++    candidates.append((runtime_user, runtime_pass, 'admin'))
++
++    token = str(t or '').lower()
++    salt = str(s or '')
++    plain_candidates = _password_candidates(p) if p is not None else []
++
++    for username, password, role in candidates:
++        if username != u:
++            continue
++        authenticated = False
++        if token and salt:
++            authenticated = token == hashlib.md5((password + salt).encode()).hexdigest()
++        if not authenticated:
++            authenticated = any(candidate == password for candidate in plain_candidates)
++        if authenticated:
++            auth = {'username': username, 'role': role, 'enabled': True}
+             current_auth_var.set(auth)
+             return auth
+-    runtime = get_runtime_settings()
+-    subsonic_user = str(runtime.get('subsonic_user') or settings.subsonic_user)
+-    subsonic_pass = str(runtime.get('subsonic_pass') or settings.subsonic_pass)
+-    expected = hashlib.md5((subsonic_pass + s).encode()).hexdigest()
+-    if u == subsonic_user and t == expected:
+-        auth = {'username': u, 'role': 'admin', 'enabled': True}
+-        current_auth_var.set(auth)
+-        return auth
++
+     raise HTTPException(status_code=401, detail='Wrong username or password')
+ 
+ 
+@@ -272,14 +324,9 @@
+ 
+ 
+ def _slugify(value: str, fallback_prefix: str = 'item') -> str:
+-    text = str(value or '').strip().lower()
+-    text = re.sub(r'\s+', '-', text)
+-    text = re.sub(r'[^0-9a-z\u4e00-\u9fff._()\-]+', '-', text)
+-    text = re.sub(r'-{2,}', '-', text).strip('-')
+-    if text:
+-        return text
+-    digest = hashlib.sha1(str(value or '').encode('utf-8')).hexdigest()[:8]
+-    return f'{fallback_prefix}-{digest}'
++    # Single source of truth shared with the DB layer so ids returned by
++    # listing endpoints always resolve in the detail endpoints.
++    return slugify(value, fallback_prefix)
+ 
+ 
+ def _artist_slug(name: str) -> str:
+@@ -334,7 +381,7 @@
+         'albumCount': len(albums),
+         'coverArt': next((song['id'] for song in artist_songs if song.get('cover_path')), ''),
+         'album': albums,
+-        'song': [to_subsonic_song(song, auth) for song in artist_songs[:20]],
++        'song': [to_subsonic_song(song, auth) for song in artist_songs],
+     }
+ 
+ 
+@@ -494,14 +541,12 @@
+ @router.api_route('/getOpenSubsonicExtensions', methods=['GET', 'POST'])
+ @router.api_route('/getOpenSubsonicExtensions.view', methods=['GET', 'POST'])
+ def get_open_subsonic_extensions(__auth: str = Depends(verify_subsonic_auth)):
+-    return ok({
+-        'openSubsonicExtensions': {
+-            'openSubsonicExtension': [
+-                {'name': 'openSubsonic', 'versions': '1'},
+-                {'name': 'transcodeOffset', 'versions': '1'},
+-            ]
+-        }
+-    })
++    # OpenSubsonic spec: `openSubsonicExtensions` is an ARRAY of objects
++    # {"name": str, "versions": [int]}.  Returning an object here made strict
++    # clients (Symfonium) abort the whole library sync with
++    # "Expected BEGIN_ARRAY but was BEGIN_OBJECT".
++    # Only advertise extensions that are actually implemented.
++    return ok({'openSubsonicExtensions': []})
+ 
+ 
+ @router.api_route('/getMusicFolders', methods=['GET', 'POST'])
+@@ -516,7 +561,9 @@
+ @router.api_route('/getIndexes.view', methods=['GET', 'POST'])
+ def get_indexes(__auth: dict = Depends(verify_subsonic_auth)):
+     payload = build_indexes()
+-    payload['shortcut'] = {}
++    # `shortcut` is an array in the Subsonic schema; `{}` broke strict JSON
++    # parsers with "Expected BEGIN_ARRAY but was BEGIN_OBJECT".
++    payload['shortcut'] = []
+     artist_total = sum(len(item.get('artist', [])) for item in payload.get('index', []))
+     print(f"[subsonic:resp] getIndexes artists={artist_total} groups={len(payload.get('index', []))}")
+     return ok({'indexes': payload})
+@@ -545,8 +592,8 @@
+ 
+ @router.api_route('/getSongsByGenre', methods=['GET', 'POST'])
+ @router.api_route('/getSongsByGenre.view', methods=['GET', 'POST'])
+-def get_songs_by_genre(genre: str, count: int = Query(50), __auth: dict = Depends(verify_subsonic_auth)):
+-    songs = list_songs_by_genre(genre, count)
++def get_songs_by_genre(genre: str, count: int = Query(50), offset: int = Query(0), __auth: dict = Depends(verify_subsonic_auth)):
++    songs = list_songs_by_genre(genre, count, offset)
+     return ok({'songsByGenre': {'song': [to_subsonic_song(song, __auth) for song in songs]}})
+ 
+ 
+@@ -581,26 +628,50 @@
+ 
+ @router.api_route('/getAlbumList', methods=['GET', 'POST'])
+ @router.api_route('/getAlbumList.view', methods=['GET', 'POST'])
+-def get_album_list(__auth: dict = Depends(verify_subsonic_auth)):
++def get_album_list(
++    type: str = Query('random'),
++    size: int = Query(10),
++    offset: int = Query(0),
++    fromYear: int | None = Query(None),
++    toYear: int | None = Query(None),
++    genre: str | None = Query(None),
++    musicFolderId: str | None = Query(None),
++    __auth: dict = Depends(verify_subsonic_auth),
++):
+     albums = build_album_list()
+-    print(f"[subsonic:resp] getAlbumList albums={len(albums)}")
+-    return ok({'albumList': {'album': albums}})
++    normalized_type = (type or 'random').strip().lower()
++    wanted_genre = str(genre or '').strip().lower()
++    if wanted_genre:
++        albums = [item for item in albums if str(item.get('genre') or '').strip().lower() == wanted_genre]
++
++    if normalized_type in {'newest', 'recent'}:
++        albums = sorted(albums, key=lambda item: str(item.get('created') or ''), reverse=True)
++    elif normalized_type == 'alphabeticalbyartist':
++        albums = sorted(albums, key=lambda item: (str(item.get('artist') or '').lower(), str(item.get('name') or '').lower()))
++    elif normalized_type == 'alphabeticalbyname':
++        albums = sorted(albums, key=lambda item: str(item.get('name') or '').lower())
++    elif normalized_type in {'frequent', 'highest'}:
++        song_map = {_slugify(song['album'], 'album'): int(song.get('plays') or 0) for song in list_songs()}
++        albums = sorted(albums, key=lambda item: song_map.get(str(item.get('id') or ''), 0), reverse=True)
++    elif normalized_type == 'random':
++        albums = list(albums)
++        random.shuffle(albums)
++
++    _ = (fromYear, toYear, musicFolderId)
++    safe_size = max(0, min(int(size or 0), 500))
++    safe_offset = max(0, int(offset or 0))
++    paged = albums[safe_offset:safe_offset + safe_size] if safe_size else []
++    print(f"[subsonic:resp] getAlbumList type={normalized_type} total={len(albums)} returned={len(paged)} offset={safe_offset} size={safe_size}")
++    return ok({'albumList': {'album': paged}})
+ 
+ 
+ @router.api_route('/startScan', methods=['GET', 'POST'])
+ @router.api_route('/startScan.view', methods=['GET', 'POST'])
+ def start_scan(__auth: dict = Depends(verify_subsonic_auth)):
+-    stats = _library_stats()
+-    print(f"[subsonic:resp] startScan count={int(stats['count'])} albums={int(stats['albumCount'])} artists={int(stats['artistCount'])} folders={int(stats['folderCount'])}")
+-    return ok({
+-        'scanStatus': {
+-            'scanning': True,
+-            'count': int(stats['count']),
+-            'albumCount': int(stats['albumCount']),
+-            'artistCount': int(stats['artistCount']),
+-            'folderCount': int(stats['folderCount']),
+-        }
+-    })
++    # Scanning is driven by the web console / scheduler.  Reporting a hard
++    # coded `scanning: true` made clients poll forever waiting for a scan that
++    # never finished, so just report the real task state.
++    return get_scan_status(__auth)
+ 
+ 
+ @router.api_route('/getAlbumList2', methods=['GET', 'POST'])
+@@ -609,16 +680,34 @@
+     type: str = Query('random'),
+     size: int = Query(20),
+     offset: int = Query(0),
++    fromYear: int | None = Query(None),
++    toYear: int | None = Query(None),
++    genre: str | None = Query(None),
++    musicFolderId: str | None = Query(None),
+     __auth: dict = Depends(verify_subsonic_auth),
+ ):
+     albums = build_album_list()
+     normalized_type = (type or 'random').strip().lower()
++    wanted_genre = str(genre or '').strip().lower()
++
++    if wanted_genre:
++        albums = [item for item in albums if str(item.get('genre') or '').strip().lower() == wanted_genre]
+ 
+     if normalized_type in {'newest', 'recent'}:
+-        albums = list(albums)
++        # Newest first; albums without a timestamp sort last.
++        albums = sorted(albums, key=lambda item: str(item.get('created') or ''), reverse=True)
+     elif normalized_type == 'frequent':
+         song_map = {_slugify(song['album'], 'album'): int(song.get('plays') or 0) for song in list_songs()}
+         albums = sorted(albums, key=lambda item: song_map.get(str(item.get('id') or ''), 0), reverse=True)
++    elif normalized_type == 'highest':
++        song_map = {_slugify(song['album'], 'album'): int(song.get('plays') or 0) for song in list_songs()}
++        albums = sorted(albums, key=lambda item: song_map.get(str(item.get('id') or ''), 0), reverse=True)
++    elif normalized_type == 'starred':
++        starred_ids = {
++            _slugify(str(song.get('album') or ''), 'album')
++            for song in list_starred_items(str(__auth.get('username') or '')).get('song', [])
++        }
++        albums = [item for item in albums if str(item.get('id') or '') in starred_ids]
+     elif normalized_type == 'alphabeticalbyartist':
+         albums = sorted(albums, key=lambda item: (str(item.get('artist') or '').lower(), str(item.get('name') or '').lower()))
+     elif normalized_type in {'alphabeticalbyname', 'alphabetical'}:
+@@ -628,6 +717,10 @@
+         random.shuffle(albums)
+     else:
+         albums = list(albums)
++
++    # `year` is not stored yet, so fromYear/toYear are accepted but ignored
++    # instead of filtering every album out.
++    _ = (fromYear, toYear, musicFolderId)
+ 
+     safe_size = max(0, min(int(size or 0), 500))
+     safe_offset = max(0, int(offset or 0))
+@@ -727,6 +820,12 @@
+     })
+ 
+ 
++@router.api_route('/getAlbumInfo2', methods=['GET', 'POST'])
++@router.api_route('/getAlbumInfo2.view', methods=['GET', 'POST'])
++def get_album_info2(id: str, __auth: dict = Depends(verify_subsonic_auth)):
++    return get_album_info(id, __auth)
++
++
+ @router.api_route('/getSong', methods=['GET', 'POST'])
+ @router.api_route('/getSong.view', methods=['GET', 'POST'])
+ def get_song_endpoint(id: str, __auth: str = Depends(verify_subsonic_auth)):
+@@ -845,7 +944,8 @@
+     }
+ 
+ 
+-@router.get('/search2')
++@router.api_route('/search2', methods=['GET', 'POST'])
++@router.api_route('/search2.view', methods=['GET', 'POST'])
+ def search2(
+     query: str = Query(''),
+     artistCount: int = Query(MAX_SEARCH_RESULTS),
+@@ -860,7 +960,8 @@
+     return ok({'searchResult2': payload})
+ 
+ 
+-@router.get('/search3')
++@router.api_route('/search3', methods=['GET', 'POST'])
++@router.api_route('/search3.view', methods=['GET', 'POST'])
+ def search3(
+     query: str = Query(''),
+     artistCount: int = Query(MAX_SEARCH_RESULTS),
+@@ -1056,12 +1157,35 @@
+ @router.api_route('/createPlaylist', methods=['GET', 'POST'])
+ @router.api_route('/createPlaylist.view', methods=['GET', 'POST'])
+ def create_playlist_endpoint(
+-    name: str = Query(...),
++    playlistId: str | None = Query(None),
++    name: str | None = Query(None),
+     songId: list[str] | None = Query(None),
+     __auth: dict = Depends(verify_subsonic_auth),
+ ):
++    # Subsonic: when `playlistId` is supplied createPlaylist must *replace* the
++    # tracks of that playlist instead of creating a duplicate playlist.
++    if playlistId:
++        existing = get_playlist(playlistId)
++        if not existing:
++            return fail('Playlist not found')
++        if not _can_modify_playlist(__auth, existing):
++            return fail('Permission denied')
++        current_ids = [str(entry.get('id') or '') for entry in existing.get('entries', [])]
++        playlist = update_playlist(
++            playlist_id=playlistId,
++            name=name or None,
++            song_ids_to_add=songId or [],
++            song_ids_to_remove=current_ids,
++        )
++        if not playlist:
++            return fail('Playlist not found')
++        return ok({'playlist': {'id': playlist['id'], 'name': playlist['name']}})
++
++    if not str(name or '').strip():
++        return fail('Missing playlist name')
++
+     playlist = create_playlist(
+-        name=name,
++        name=str(name),
+         song_ids=songId or [],
+         owner=str(__auth.get('username') or 'admin'),
+         public=False,
+@@ -1116,7 +1240,8 @@
+     return ok()
+ 
+ 
+-@router.get('/scrobble')
++@router.api_route('/scrobble', methods=['GET', 'POST'])
++@router.api_route('/scrobble.view', methods=['GET', 'POST'])
+ def scrobble(
+     id: str,
+     time: int | None = Query(None),
+@@ -1364,12 +1489,43 @@
+     return ok({'lyrics': {'artist': artist or (song or {}).get('artist', ''), 'title': title or (song or {}).get('title', ''), 'value': lyrics}})
+ 
+ 
++@router.api_route('/getLyricsBySongId', methods=['GET', 'POST'])
++@router.api_route('/getLyricsBySongId.view', methods=['GET', 'POST'])
++def get_lyrics_by_song_id(id: str, __auth: dict = Depends(verify_subsonic_auth)):
++    """OpenSubsonic `songLyrics` shape used by newer clients."""
++    song = get_song(id)
++    if not song:
++        return fail('Song not found')
++    lyrics = str(song.get('lyrics') or '').strip()
++    if not lyrics:
++        lyrics = _extract_embedded_lyrics(song)
++    if not lyrics and str(song.get('fmt') or '') == 'VIRTUAL':
++        lyrics = _fetch_virtual_lyrics(song)
++    lines = [{'value': line} for line in lyrics.splitlines() if line.strip()]
++    structured = []
++    if lines:
++        structured.append({
++            'displayArtist': str(song.get('artist') or ''),
++            'displayTitle': str(song.get('title') or ''),
++            'lang': '',
++            'synced': False,
++            'line': lines,
++        })
++    return ok({'lyricsList': {'structuredLyrics': structured}})
++
++
+ @router.api_route('/getSimilarSongs', methods=['GET', 'POST'])
+ @router.api_route('/getSimilarSongs.view', methods=['GET', 'POST'])
+ def get_similar_songs(id: str, count: int = Query(20), __auth: str = Depends(verify_subsonic_auth)):
+     songs = [song for song in list_songs() if song.get('id') != id]
+     safe_count = max(0, min(int(count or 0), 100))
+     return ok({'similarSongs': {'song': [to_subsonic_song(song, __auth) for song in songs[:safe_count]]}})
++
++
++@router.api_route('/getSimilarSongs2', methods=['GET', 'POST'])
++@router.api_route('/getSimilarSongs2.view', methods=['GET', 'POST'])
++def get_similar_songs2(id: str, count: int = Query(20), __auth: str = Depends(verify_subsonic_auth)):
++    return get_similar_songs(id, count, __auth)
+ 
+ 
+ def to_subsonic_album(song: dict, songs: list[dict] | None = None) -> dict:
+@@ -1384,7 +1540,7 @@
+         'artistId': _artist_slug(song.get('artist') or ''),
+         'songCount': len(album_songs),
+         'duration': sum(int(item.get('dur') or 0) for item in album_songs),
+-        'created': '',
++        'created': dt_to_iso(first_song.get('created_at')) or '',
+         'year': 0,
+         'genre': str(first_song.get('genre') or ''),
+         'coverArt': next((item['id'] for item in album_songs if item.get('cover_path')), song['id'] if song.get('cover_path') else ''),
+@@ -1408,11 +1564,13 @@
+     auth = auth or current_auth_var.get() or {}
+     username = str(auth.get('username') or '')
+     song_id = str(song.get('id') or '')
+-    album_id = _slugify(str(song.get('album') or ''), 'album')
+-    artist_id = _artist_slug(str(song.get('artist') or ''))
+     bookmark = get_bookmark(username, song_id) if username else None
++    # Subsonic models `starred` as an ISO-8601 date string (or omits it), never
++    # as a boolean.  Sending `false` made strict JSON clients fail to parse the
++    # whole song object.
++    starred_at = get_starred_at(username, 'song', song_id) if username else ''
+     has_cover = bool(song.get('cover_path')) or (str(song.get('fmt') or '') == 'VIRTUAL' and bool(_virtual_cover_url(song)))
+-    return {
++    payload = {
+         'id': song['id'],
+         'parent': _slugify(song['album'], 'album'),
+         'title': song['title'],
+@@ -1430,9 +1588,9 @@
+         'contentType': content_map.get(song['fmt'], 'audio/mpeg'),
+         'bitRate': 0,
+         'size': 0,
+-        'starred': is_starred_item(username, 'song', song_id) if username else False,
+         'userRating': get_song_rating(username, song_id) if username else 0,
+-        'albumStarred': is_starred_item(username, 'album', album_id) if username else False,
+-        'artistStarred': is_starred_item(username, 'artist', artist_id) if username else False,
+         'bookmarkPosition': int((bookmark or {}).get('position_ms') or 0),
+     }
++    if starred_at:
++        payload['starred'] = starred_at
++    return payload
+--- a/app/services/db_data.py
++++ b/app/services/db_data.py
+@@ -12,6 +12,7 @@
+ from sqlalchemy import text, bindparam
+ 
+ from app.core.config import settings
++from app.core.slugs import album_id, artist_id
+ from app.db.session import engine, is_sqlite
+ from app.db.compat import (
+     add_column_if_missing,
+@@ -20,6 +21,7 @@
+     db_json_value_expr,
+     db_now_expr,
+     db_timestamp_type,
++    dt_to_iso,
+     json_dumps,
+     json_loads,
+ )
+@@ -542,7 +544,7 @@
+ def list_songs() -> list[dict[str, Any]]:
+     with engine.connect() as connection:
+         rows = connection.execute(text('''
+-            SELECT id, title, artist, album, fmt, dur, path, plays, raw_url, provider_id, cover_path, cover_art, genre, album_artist, lyrics
++            SELECT id, title, artist, album, fmt, dur, path, plays, raw_url, provider_id, cover_path, cover_art, genre, album_artist, lyrics, created_at, updated_at
+             FROM songs
+             ORDER BY updated_at DESC, id ASC
+         ''')).mappings().all()
+@@ -1151,27 +1153,55 @@
+     return [dict(item) for item in SUBSONIC_ITEMS]
+ 
+ 
++def _to_epoch_seconds(value: Any) -> int:
++    """Best-effort conversion of the stored timestamp formats to epoch seconds."""
++    if value is None:
++        return 0
++    if isinstance(value, datetime):
++        moment = value
++    else:
++        raw = str(value).strip()
++        if not raw:
++            return 0
++        try:
++            moment = datetime.fromisoformat(raw.replace('Z', '+00:00'))
++        except ValueError:
++            return 0
++    if moment.tzinfo is None:
++        moment = moment.replace(tzinfo=timezone.utc)
++    return int(moment.timestamp())
++
++
+ def build_indexes() -> dict[str, Any]:
+     songs = list_songs()
+     grouped: dict[str, list[dict[str, Any]]] = {}
+     artist_map: dict[str, list[dict[str, Any]]] = {}
++    last_modified = 0
+     for song in songs:
+-        artist_map.setdefault(str(song['artist']), []).append(song)
++        artist_name = str(song.get('artist') or '').strip()
++        if not artist_name:
++            continue
++        artist_map.setdefault(artist_name, []).append(song)
++        last_modified = max(last_modified, _to_epoch_seconds(song.get('updated_at')))
+     for artist in sorted(artist_map.keys()):
+-        letter = artist[0].upper() if artist and artist[0].isalpha() else '#'
++        # Subsonic index groups are a single A-Z letter or '#'; non-latin
++        # names must not leak a CJK character as the index name.
++        head = artist[0].upper()
++        letter = head if 'A' <= head <= 'Z' else '#'
+         artist_songs = artist_map[artist]
+         grouped.setdefault(letter, []).append(
+             {
+-                'id': artist.lower().replace(' ', '-'),
++                'id': artist_id(artist),
+                 'name': artist,
+                 'albumCount': len({song['album'] for song in artist_songs}),
+                 'coverArt': next((song['id'] for song in artist_songs if song.get('cover_path')), ''),
+             }
+         )
++    ordered = sorted(grouped.items(), key=lambda item: (item[0] == '#', item[0]))
+     return {
+-        'lastModified': 0,
+-        'ignoredArticles': 'The',
+-        'index': [{'name': key, 'artist': value} for key, value in grouped.items()],
++        'lastModified': last_modified * 1000,
++        'ignoredArticles': 'The El La Los Las Le Les',
++        'index': [{'name': key, 'artist': value} for key, value in ordered],
+     }
+ 
+ 
+@@ -1184,16 +1214,20 @@
+     albums: list[dict[str, Any]] = []
+     for album_name, album_songs in album_map.items():
+         first_song = album_songs[0]
++        created = max(
++            (dt_to_iso(item.get('created_at')) for item in album_songs if item.get('created_at')),
++            default='',
++        )
+         albums.append(
+             {
+-                'id': album_name.lower().replace(' ', '-'),
++                'id': album_id(album_name),
+                 'name': album_name,
+                 'title': album_name,
+                 'artist': first_song['artist'],
+-                'artistId': first_song['artist'].lower().replace(' ', '-'),
++                'artistId': artist_id(first_song['artist']),
+                 'songCount': len(album_songs),
+                 'duration': sum(int(item.get('dur') or 0) for item in album_songs),
+-                'created': '',
++                'created': created,
+                 'year': 0,
+                 'genre': str(first_song.get('genre') or ''),
+                 'coverArt': next((item['id'] for item in album_songs if item.get('cover_path')), first_song['id'] if first_song.get('cover_path') else ''),
+@@ -1283,6 +1317,15 @@
+ 
+ 
+ 
++def _play_timestamp_text(value: Any) -> str:
++    if value is None:
++        return ''
++    if isinstance(value, datetime):
++        return value.strftime('%Y-%m-%d %H:%M UTC')
++    # SQLite stores timestamps as TEXT, so `.strftime` would blow up.
++    return str(value).strip()
++
++
+ def list_recent_plays(limit: int = 10) -> list[dict[str, Any]]:
+     page_size = max(1, min(int(limit or 10), 50))
+     with engine.connect() as connection:
+@@ -1301,7 +1344,7 @@
+         {
+             'id': row['id'],
+             'song_id': row['song_id'],
+-            'played_at': row['played_at'].strftime('%Y-%m-%d %H:%M UTC') if row['played_at'] else '',
++            'played_at': _play_timestamp_text(row['played_at']),
+             'source': row['source'],
+             'submission': row['submission'],
+             'client': row['client'],
+@@ -1401,10 +1444,8 @@
+     album_map: dict[str, dict[str, Any]] = {}
+     artist_map: dict[str, dict[str, Any]] = {}
+     for song in songs:
+-        album_id = str(song.get('album') or '').lower().replace(' ', '-')
+-        artist_id = str(song.get('artist') or '').lower().replace(' ', '-')
+-        album_map.setdefault(album_id, song)
+-        artist_map.setdefault(artist_id, song)
++        album_map.setdefault(album_id(str(song.get('album') or '')), song)
++        artist_map.setdefault(artist_id(str(song.get('artist') or '')), song)
+     with engine.connect() as connection:
+         rows = connection.execute(
+             text('''
+@@ -1439,7 +1480,7 @@
+             connection.execute(text('DELETE FROM ratings WHERE username = :username AND song_id = :song_id'), {'username': uname, 'song_id': sid})
+         else:
+             connection.execute(
+-                text('''
++                text(f'''
+                     INSERT INTO ratings (username, song_id, rating)
+                     VALUES (:username, :song_id, :rating)
+                     ON CONFLICT (username, song_id)
+@@ -1534,6 +1575,30 @@
+             {'username': uname, 'item_type': item_type, 'item_id': item_id},
+         ).scalar()
+     return bool(value)
++
++
++def get_starred_at(username: str, item_type: str, item_id: str) -> str:
++    """Return the ISO-8601 timestamp of a starred item, or '' when not starred.
++
++    Subsonic represents ``starred`` as a date string in JSON, not as a boolean;
++    returning the real timestamp keeps strict clients (Symfonium) happy and
++    still works as a truthiness check.
++    """
++    uname = str(username or '').strip()
++    itype = str(item_type or '').strip()
++    iid = str(item_id or '').strip()
++    if not uname or not itype or not iid:
++        return ''
++    with engine.connect() as connection:
++        value = connection.execute(
++            text('''
++                SELECT created_at FROM starred_items
++                WHERE username = :username AND item_type = :item_type AND item_id = :item_id
++                LIMIT 1
++            '''),
++            {'username': uname, 'item_type': itype, 'item_id': iid},
++        ).scalar()
++    return dt_to_iso(value)
+ 
+ 
+ 
+@@ -1552,9 +1617,10 @@
+ 
+ 
+ 
+-def list_songs_by_genre(genre: str, limit: int = 50) -> list[dict[str, Any]]:
++def list_songs_by_genre(genre: str, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+     wanted = str(genre or '').strip()
+     page_size = max(1, min(int(limit or 50), 500))
++    page_offset = max(0, int(offset or 0))
+     if not wanted:
+         return []
+     with engine.connect() as connection:
+@@ -1564,9 +1630,9 @@
+                 FROM songs
+                 WHERE genre = :genre
+                 ORDER BY plays DESC, updated_at DESC, id ASC
+-                LIMIT :limit
+-            '''),
+-            {'genre': wanted, 'limit': page_size},
++                LIMIT :limit OFFSET :offset
++            '''),
++            {'genre': wanted, 'limit': page_size, 'offset': page_offset},
+         ).mappings().all()
+     return [dict(row) for row in rows]
+ 
+--- a/app/services/cover_cache.py
++++ b/app/services/cover_cache.py
+@@ -3,6 +3,7 @@
+ import base64
+ import hashlib
+ import io
++import os
+ from pathlib import Path
+ 
+ try:
+@@ -10,7 +11,23 @@
+ except ImportError:
+     Image = None
+ 
+-COVER_DIR = Path('/app/data/covers')
++
++def _data_root() -> Path:
++    """Resolve the writable data directory.
++
++    Docker images use ``/app/data``; a source checkout keeps everything under
++    ``backend/data`` so running outside the container does not try to write to
++    ``C:\\app`` / ``/app``.
++    """
++    override = os.environ.get('MUSICON_DATA_DIR')
++    if override:
++        return Path(override)
++    if Path('/app').is_dir():
++        return Path('/app/data')
++    return Path(__file__).resolve().parents[2] / 'data'
++
++
++COVER_DIR = _data_root() / 'covers'
+ THUMB_DIR = COVER_DIR / 'thumbs'
+ COVER_DIR.mkdir(parents=True, exist_ok=True)
+ THUMB_DIR.mkdir(parents=True, exist_ok=True)
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -12,5 +12,6 @@
+ alembic==1.13.2
+ Pillow==10.3.0
+ apscheduler==3.10.4
++cryptography>=42.0.0
+ p115client==0.0.8.4.8
+ oss2==2.18.5
