@@ -14,7 +14,8 @@ services:
       # LX_SERVICE_MODE: remote
       # LX_REMOTE_URL: http://192.168.1.10:9527
     ports:
-      - "8000:8000"
+      # 服务器部署建议在 .env 里设 MUSICON_BIND=127.0.0.1，只允许本机反代访问。
+      - "${MUSICON_BIND:-0.0.0.0}:8000:8000"
     volumes:
       - ./data:/app/data
       # - ./vendor/lxserver:/app/vendor/lxserver:ro
